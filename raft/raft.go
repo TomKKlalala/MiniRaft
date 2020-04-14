@@ -18,19 +18,18 @@ package raft
 //
 
 import (
+	"../labgob"
+	"../labrpc"
+	"bytes"
 	"encoding/json"
 	"log"
 	"math/rand"
 	"net/http"
+	_ "net/http/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
 )
-import "../labrpc"
-import _ "net/http/pprof"
-
-// import "bytes"
-// import "../labgob"
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
@@ -220,7 +219,7 @@ election:
 					rf.mu.Lock()
 					if rf.currentTerm < v.Term {
 						rf.currentTerm = v.Term
-						rf.votedFor = -1
+						rf.persist()
 						rf.switchToFollower()
 						rf.mu.Unlock()
 						return
@@ -346,14 +345,26 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	err := e.Encode(rf.currentTerm)
+	if err != nil {
+		panic(err)
+	}
+	err = e.Encode(rf.votedFor)
+	if err != nil {
+		panic(err)
+	}
+	err = e.Encode(rf.logIndex)
+	if err != nil {
+		panic(err)
+	}
+	err = e.Encode(rf.logs)
+	if err != nil {
+		panic(err)
+	}
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -373,19 +384,23 @@ func (rf *Raft) readPersist(data []byte) {
 		}
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int64
+	var votedFor int
+	var logs LogEntries
+	var logIndex int64
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logIndex) != nil ||
+		d.Decode(&logs) != nil {
+		panic("fail to decode: persistent data has been corrupted")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logIndex = logIndex
+		rf.logs = logs
+	}
 }
 
 //  RequestVote RPC arguments structure.
@@ -429,6 +444,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// change to follower state
 		rf.switchToFollower()
 		rf.currentTerm = args.Term
+		rf.persist()
 	} else if rf.currentTerm == args.Term {
 		if rf.votedFor != -1 && rf.votedFor != args.CandidateID {
 			reply.VoteGranted = false
@@ -439,9 +455,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if lastLogEntry.Term < args.LastLogTerm {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
+		rf.persist()
 	} else if lastLogEntry.Term == args.LastLogTerm && lastLogEntry.Index <= args.LastLogIndex {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
+		rf.persist()
 	} else {
 		reply.VoteGranted = false
 	}
@@ -535,13 +553,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	if rf.currentTerm <= args.Term {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		// TODO: persist
 		// receive RPC from a legitimate leader,
 		rf.switchToFollower()
 	}
+
 	reply.Term = rf.currentTerm
 	atomic.StoreInt32(&rf.heardFromLeader, 1)
 	rf.leaderID = args.LeaderID
@@ -640,7 +659,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// append locally
 	rf.logs[entry.Index] = entry
 	_, _ = DPrintf("Term_%d [%d]:%s start to replicate a log at %d\n All: %v\n", rf.currentTerm, rf.me, rf.getRole(), index, rf.logs)
-	// TODO: persist
+	rf.persist()
 	rf.mu.Unlock()
 
 	successCh := make(chan struct{}, len(rf.peers)-1)
@@ -675,13 +694,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					successCh <- struct{}{}
 					return
 				} else {
-					rf.mu.RLock()
+					rf.mu.Lock()
 					if rf.currentTerm < reply.Term {
-						rf.mu.RUnlock()
+						rf.currentTerm = reply.Term
+						rf.persist()
 						rf.switchToFollower()
+						rf.mu.Unlock()
+						exitCh <- struct{}{}
 						return
 					}
-					rf.mu.RUnlock()
+					rf.mu.Unlock()
 					if !rf.isLeader() {
 						exitCh <- struct{}{}
 						return
@@ -741,6 +763,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			}
 		}
 	}()
+
 	return int(entry.Index), int(entry.Term), true
 }
 
