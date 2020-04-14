@@ -179,6 +179,8 @@ election:
 		_, _ = DPrintf("Term_%d [%d] start election", rf.currentTerm, rf.me)
 		lastLogEntry := rf.logs[int64(len(rf.logs)-1)]
 		currentTerm := rf.currentTerm
+		// vote for self
+		rf.votedFor = rf.me
 		rf.mu.Unlock()
 		voteCh := make(chan *RequestVoteReply, len(rf.peers)-1)
 		for i := 0; i < len(rf.peers); i++ {
@@ -325,6 +327,8 @@ func (rf *Raft) switchToFollower() {
 
 	_, _ = DPrintf("Term_%d [%d] switch from %s to follower", rf.currentTerm, rf.me, rf.getRole())
 
+	// clear vote
+	rf.votedFor = -1
 	atomic.StoreInt32((*int32)(&rf.role), int32(Follower))
 
 	// waiting to be elected as a leader at any time
@@ -557,7 +561,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
-		rf.votedFor = -1
 		// receive RPC from a legitimate leader,
 		rf.switchToFollower()
 	}
