@@ -305,7 +305,7 @@ func (rf *Raft) rebel() {
 			rf.mu.RUnlock()
 			return
 		}
-		if rf.isLeader() || rf.isCandidate() {
+		if !rf.isFollower() {
 			return
 		}
 		if atomic.LoadInt32(&rf.heardFromLeader) == 0 {
@@ -554,7 +554,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
-	if rf.currentTerm <= args.Term {
+
+	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		// receive RPC from a legitimate leader,
@@ -593,9 +594,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				}
 				// update log index to the last new entry
 				rf.logIndex = args.Entries[esize-1].Index
-				// abandon rest log entries
+				// abandon rest of log entries
 				rf.logs.removeAfter(rf.logIndex)
-				// don't return, safe to commit phase
+				// safe to commit phase
 			} else {
 				idx := rf.firstLogEntryWithTerm(targetEntry.Term)
 				reply.XIndex = idx
@@ -608,8 +609,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.commitIndex < args.LeaderCommit {
 		i := rf.commitIndex + 1
 		// rf.commitIndex = min(latest log index, LeaderCommit)
-		if int64(len(rf.logs))-1 < args.LeaderCommit {
-			rf.commitIndex = int64(len(rf.logs)) - 1
+		if rf.logIndex < args.LeaderCommit {
+			rf.commitIndex = rf.logIndex
 		} else {
 			rf.commitIndex = args.LeaderCommit
 		}
@@ -646,7 +647,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// so incrementing logIndex should be execute with adding entry atomically
 	// entry needs to be added in order
 	rf.mu.Lock()
-	index := atomic.AddInt64(&rf.logIndex, 1)
+	rf.logIndex += 1
+	index := rf.logIndex
 	term := rf.currentTerm
 	leaderCommit := rf.commitIndex
 	entry := LogEntry{
@@ -663,7 +665,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Unlock()
 
 	successCh := make(chan struct{}, len(rf.peers)-1)
-	exitCh := make(chan struct{}, len(rf.peers)-1)
+	exitCh := make(chan struct{}, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
