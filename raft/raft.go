@@ -26,6 +26,7 @@ import (
 	"math/rand"
 	"net/http"
 	_ "net/http/pprof"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,31 +81,23 @@ const (
 )
 
 type LogEntry struct {
-	Command interface{}
+	Command interface{} `json:"-"`
 	Index   int64
 	Term    int64
 }
 
-func (entry *LogEntry) String() string {
-	byts, _ := json.Marshal(entry)
-	return string(byts)
+func (entry LogEntry) String() string {
+	return strconv.Itoa(int(entry.Term))
 }
 
 type LogEntries map[int64]LogEntry
 
 func (le LogEntries) subMap(lo, hi int64) []LogEntry {
 	var result []LogEntry
-	for i := lo; i <= hi; i++ {
+	for i := lo; i < hi; i++ {
 		result = append(result, le[i])
 	}
 	return result
-}
-
-func (le LogEntries) removeAfter(index int64) {
-	size := int64(len(le))
-	for i := index + 1; i < size; i++ {
-		delete(le, i)
-	}
 }
 
 //
@@ -247,7 +240,7 @@ func (rf *Raft) heartbeat() {
 	for {
 		if rf.killed() {
 			rf.mu.RLock()
-			_, _ = DPrintf("Term_%d [%d]:%s is crashed", rf.currentTerm, rf.me, rf.getRole())
+			_, _ = DPrintf("Term_%d [%d]:%9s is crashed", rf.currentTerm, rf.me, rf.getRole())
 			rf.mu.RUnlock()
 			return
 		}
@@ -273,7 +266,6 @@ func (rf *Raft) heartbeat() {
 				go rf.sendAppendEntries(i, args, reply)
 			}
 		}
-		//only send heartbeat in idle time
 		time.Sleep(rf.heartbeatInterval)
 	}
 }
@@ -303,7 +295,7 @@ func (rf *Raft) rebel() {
 		time.Sleep(rf.generateElectionTimeout())
 		if rf.killed() {
 			rf.mu.RLock()
-			_, _ = DPrintf("Term_%d [%d]:%s is crashed", rf.currentTerm, rf.me, rf.getRole())
+			_, _ = DPrintf("Term_%d [%d]:%9s is crashed", rf.currentTerm, rf.me, rf.getRole())
 			rf.mu.RUnlock()
 			return
 		}
@@ -507,8 +499,8 @@ type AppendEntriesArgs struct {
 	LeaderID     int
 	PrevLogIndex int64
 	PrevLogTerm  int64
-	Entries      []LogEntry
 	LeaderCommit int64
+	Entries      []LogEntry
 }
 
 func (args *AppendEntriesArgs) String() string {
@@ -544,14 +536,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.RLock()
-	if len(args.Entries) != 0 {
-		_, _ = DPrintf("Term_%d [%d]:%s got AE request from [%d] with args:%s", rf.currentTerm, rf.me, rf.getRole(), args.LeaderID, args)
-	}
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		rf.mu.RUnlock()
 		return
+	}
+	if len(args.Entries) != 0 {
+		_, _ = DPrintf("Term_%d [%d]:%9s got AE request from [%d] with \nargs:%v\ncommitIndex: %d\nlogIndex: %d\n", rf.currentTerm, rf.me, rf.getRole(), args.LeaderID, args, rf.commitIndex, rf.logIndex)
 	}
 	rf.mu.RUnlock()
 
@@ -561,7 +553,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
-		// receive RPC from a legitimate leader,
+		// receive RPC from a legitimate leader
 		rf.switchToFollower()
 	}
 
@@ -581,29 +573,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// don't return, safe to commit phase
 		}
 	} else {
-		if int64(len(rf.logs)-1) < args.PrevLogIndex {
-			reply.XLen = int64(len(rf.logs))
+		if rf.logIndex < args.PrevLogIndex {
+			reply.XLen = rf.logIndex + 1
+			reply.XTerm = -1
+			reply.XIndex = -1
 			reply.Success = false
 			return
 		} else {
-			reply.XLen = 0
 			targetEntry := rf.logs[args.PrevLogIndex]
 			if targetEntry.Term == args.PrevLogTerm {
 				reply.Success = true
 				esize := len(args.Entries)
+				// skip stale request
+				if args.Entries[esize-1].Index < rf.commitIndex {
+					return
+				}
 				for i := 0; i < esize; i++ {
 					entry := args.Entries[i]
+					if entry.Index <= rf.commitIndex {
+						continue
+					}
 					rf.logs[entry.Index] = entry
 				}
 				// update log index to the last new entry
 				rf.logIndex = args.Entries[esize-1].Index
-				// abandon rest of log entries
-				rf.logs.removeAfter(rf.logIndex)
 				// safe to commit phase
 			} else {
 				idx := rf.firstLogEntryWithTerm(targetEntry.Term)
 				reply.XIndex = idx
 				reply.XTerm = targetEntry.Term
+				reply.XLen = -1
 				reply.Success = false
 				return
 			}
@@ -618,7 +617,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = args.LeaderCommit
 		}
 		for ; i <= rf.commitIndex; i++ {
-			_, _ = DPrintf("Term_%d [%d]:%s successfully committed a log at %d\n %v\nAll: %v", rf.currentTerm, rf.me, rf.getRole(), i, rf.logs[i], rf.logs)
+			_, _ = DPrintf("Term_%d [%d]:%9s committed at %d\n log: %v\nAll: %v", rf.currentTerm, rf.me, rf.getRole(), i, rf.logs[i], rf.logs)
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				Command:      rf.logs[i].Command,
@@ -663,7 +662,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	lastLogEntry := rf.logs[entry.Index-1]
 	// append locally
 	rf.logs[entry.Index] = entry
-	_, _ = DPrintf("Term_%d [%d]:%s start to replicate a log at %d\n All: %v\n", rf.currentTerm, rf.me, rf.getRole(), index, rf.logs)
+	_, _ = DPrintf("Term_%d [%d]:%9s start to replicate a log at %d:%v\n", rf.currentTerm, rf.me, rf.getRole(), index, entry)
 	rf.persist()
 	rf.mu.Unlock()
 
@@ -683,17 +682,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Entries:      entries,
 			LeaderCommit: leaderCommit,
 		}
+		// TODO: limits the max number of in-flight append messages
 		go func(id int) {
 			for {
-				rf.mu.RLock()
-				args.LeaderCommit = rf.commitIndex
-				args.Term = rf.currentTerm
-				rf.mu.RUnlock()
-
 				reply := &AppendEntriesReply{}
 				rf.sendAppendEntries(id, args, reply)
 				rf.mu.RLock()
-				_, _ = DPrintf("Term_%d [%d]:%s got AE reply from [%d] with %s", rf.currentTerm, rf.me, rf.getRole(), id, reply)
+				_, _ = DPrintf("Term_%d [%d]:%9s got AE reply from [%d] with %s", rf.currentTerm, rf.me, rf.getRole(), id, reply)
 				rf.mu.RUnlock()
 				if reply.Success {
 					successCh <- struct{}{}
@@ -713,7 +708,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 						exitCh <- struct{}{}
 						return
 					}
-					if reply.XLen != 0 {
+					if reply.XLen != -1 {
 						args.PrevLogIndex = reply.XLen - 1
 					} else {
 						rf.mu.RLock()
@@ -728,7 +723,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					args.Entries = make([]LogEntry, 0)
 					rf.mu.RLock()
 					args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
-					args.Entries = rf.logs.subMap(args.PrevLogIndex+1, rf.logIndex)
+					args.Entries = rf.logs.subMap(args.PrevLogIndex+1, rf.logIndex+1)
+					args.LeaderCommit = rf.commitIndex
+					args.Term = rf.currentTerm
 					rf.mu.RUnlock()
 					//rf.mu.Lock()
 					//rf.nextIndex[id] = args.PrevLogIndex + 1
@@ -749,7 +746,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 						return
 					}
 					rf.mu.Lock()
-					_, _ = DPrintf("Term_%d [%d]:%s successfully committed a log at %d\n %v", rf.currentTerm, rf.me, rf.getRole(), index, rf.logs[index])
+					_, _ = DPrintf("Term_%d [%d]:%9s successfully committed a log at %d\n %v", rf.currentTerm, rf.me, rf.getRole(), index, rf.logs[index])
 					for i := rf.commitIndex + 1; i <= entry.Index; i++ {
 						rf.applyCh <- ApplyMsg{
 							CommandValid: true,
