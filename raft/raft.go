@@ -114,18 +114,22 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// volatile states
-	role                  Role
-	commitCond            *sync.Cond
-	commitIndex           int64
-	lastApplied           int
-	leaderID              int   // ID of the current raft leader
-	heardFromLeader       int32 // If received RPC call from leader within election timeout or not
-	electionTimeoutUbound int   // Upper bound of election timeout, unit ms
-	electionTimeoutLbound int   // Lower bound
+	role             Role
+	once             sync.Once
+	commitIndex      int64
+	followerLogIndex []int64
+	nextIndex        []int64
+	notifyLeaderCh   chan struct{}
+	lastApplied      int64
+	leaderID         int // ID of the current raft leader
+	logIndex         int64
+	applyCh          chan ApplyMsg
+	heardFromLeader  int32 // If received RPC call from leader within election timeout or not
+	// configurations
+	electionTimeoutUbound int // Upper bound of election timeout, unit ms
+	electionTimeoutLbound int // Lower bound
 	heartbeatInterval     time.Duration
-	//nextIndex             []int64
-	logIndex int64
-	applyCh  chan ApplyMsg
+	appendEntriesInterval int
 	// persistent state
 	currentTerm int64
 	votedFor    int
@@ -282,11 +286,52 @@ func (rf *Raft) switchToLeader() {
 	atomic.StoreInt32((*int32)(&rf.role), int32(Leader))
 	rf.mu.Lock()
 	rf.leaderID = rf.me
+	for i := 0; i < len(rf.peers); i++ {
+		rf.followerLogIndex[i] = 0
+		rf.nextIndex[i] = rf.logIndex
+	}
 	rf.mu.Unlock()
 
 	// periodically send heartbeat
 	go rf.heartbeat()
 
+	// waiting to commit logs
+	rf.once.Do(func() {
+		go func() {
+			var minIndex int64
+			for {
+				select {
+				case <-rf.notifyLeaderCh:
+					if !rf.isLeader() {
+						// not processing further request
+						break
+					}
+					rf.mu.RLock()
+					tmpS := make([]int64, len(rf.followerLogIndex))
+					copy(tmpS, rf.followerLogIndex)
+					minIndex = MedianOf(tmpS)
+					rf.mu.RUnlock()
+					rf.mu.Lock()
+					if rf.commitIndex < minIndex {
+						i := rf.commitIndex + 1
+						rf.commitIndex = minIndex
+						for ; i <= minIndex; i++ {
+							rf.applyCh <- ApplyMsg{
+								CommandValid: true,
+								Command:      rf.logs[i].Command,
+								CommandIndex: int(rf.logs[i].Index),
+							}
+							rf.lastApplied = i
+							_, _ = DPrintf("Term_%-4d [%d]:%-9s successfully committed a log at %d\n:%v", rf.currentTerm, rf.me, rf.getRole(), minIndex, rf.logs[minIndex])
+						}
+						rf.mu.Unlock()
+						break
+					}
+					rf.mu.Unlock()
+				}
+			}
+		}()
+	})
 }
 
 func (rf *Raft) rebel() {
@@ -396,6 +441,11 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = votedFor
 		rf.logIndex = logIndex
 		rf.logs = logs
+		// optimistically init
+		for i := 0; i < len(rf.peers); i++ {
+			rf.nextIndex[i] = logIndex
+			rf.followerLogIndex[i] = 0
+		}
 	}
 }
 
@@ -542,16 +592,7 @@ func (reply *AppendEntriesReply) String() string {
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	// according to the second 5.5 of the paper
-	// leader should keep sending request indefinitely
-	// until the follower or candidate restart
-	for {
-		ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-		if ok {
-			return ok
-		}
-		time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
-	}
+	return rf.peers[server].Call("Raft.AppendEntries", args, reply)
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -670,131 +711,114 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 
-	// so incrementing logIndex should be execute with adding entry atomically
+	// incrementing logIndex should be execute with adding entry atomically
 	// entry needs to be added in order
 	rf.mu.Lock()
 	rf.logIndex += 1
-	index := rf.logIndex
-	term := rf.currentTerm
-	leaderCommit := rf.commitIndex
 	entry := LogEntry{
 		Command: command,
-		Index:   index,
-		Term:    term,
+		Index:   rf.logIndex,
+		Term:    rf.currentTerm,
 	}
-
-	lastLogEntry := rf.logs[entry.Index-1]
 	// append locally
 	rf.logs[entry.Index] = entry
-	_, _ = DPrintf("Term_%-4d [%d]:%-9s start to replicate a log at %d:%v\n", rf.currentTerm, rf.me, rf.getRole(), index, entry)
+	rf.followerLogIndex[rf.me] = rf.logIndex
+	_, _ = DPrintf("Term_%-4d [%d]:%-9s start to replicate a log at %d:%v:%v\n", rf.currentTerm, rf.me, rf.getRole(), rf.logIndex, entry, entry.Command)
 	rf.persist()
 	rf.mu.Unlock()
 
-	successCh := make(chan struct{}, len(rf.peers)-1)
-	exitCh := make(chan struct{}, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		entries := make([]LogEntry, 1)
-		entries[0] = entry
-		args := &AppendEntriesArgs{
-			Term:         term,
-			LeaderID:     rf.me,
-			PrevLogIndex: lastLogEntry.Index,
-			PrevLogTerm:  lastLogEntry.Term,
-			Entries:      entries,
-			LeaderCommit: leaderCommit,
-		}
-		// TODO: limits the max number of in-flight append messages
-		go func(id int) {
-			for {
-				reply := &AppendEntriesReply{}
-				rf.sendAppendEntries(id, args, reply)
-				rf.mu.RLock()
-				_, _ = DPrintf("Term_%-4d [%d]:%-9s got AE reply from [%d] with %s", rf.currentTerm, rf.me, rf.getRole(), id, reply)
-				rf.mu.RUnlock()
-				if reply.Success {
-					successCh <- struct{}{}
-					return
-				} else {
-					// skip stale reply
-					if reply.ErrorHint == LowTerm {
-						continue
-					}
-					rf.mu.Lock()
-					if rf.currentTerm < reply.Term {
-						rf.currentTerm = reply.Term
-						rf.persist()
-						rf.switchToFollower()
-						rf.mu.Unlock()
-						exitCh <- struct{}{}
-						return
-					}
-					rf.mu.Unlock()
-					if !rf.isLeader() {
-						exitCh <- struct{}{}
-						return
-					}
-					if reply.XLen != -1 {
-						args.PrevLogIndex = reply.XLen - 1
-					} else {
-						rf.mu.RLock()
-						ok, idx := rf.lastLogEntryWithTerm(reply.XTerm)
-						rf.mu.RUnlock()
-						if ok {
-							args.PrevLogIndex = idx
-						} else {
-							args.PrevLogIndex = reply.XIndex - 1
-						}
-					}
-					args.Entries = make([]LogEntry, 0)
-					rf.mu.RLock()
-					args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
-					args.Entries = rf.logs.subMap(args.PrevLogIndex+1, rf.logIndex+1)
-					args.LeaderCommit = rf.commitIndex
-					args.Term = rf.currentTerm
-					rf.mu.RUnlock()
-					//rf.mu.Lock()
-					//rf.nextIndex[id] = args.PrevLogIndex + 1
-					//rf.mu.Unlock()
-					time.Sleep(time.Duration(rand.Intn(200)) * time.Millisecond)
-				}
-			}
-		}(i)
+		//TODO: limits the max number of in-flight append messages
+		go rf.replicateLogs(i, entry)
 	}
-	go func() {
-		cnt := 1
-		for {
-			select {
-			case <-successCh:
-				cnt++
-				if cnt > len(rf.peers)/2 {
-					if !rf.isLeader() {
-						return
-					}
-					rf.mu.Lock()
-					_, _ = DPrintf("Term_%-4d [%d]:%-9s successfully committed a log at %d\n %v", rf.currentTerm, rf.me, rf.getRole(), index, rf.logs[index])
-					for i := rf.commitIndex + 1; i <= entry.Index; i++ {
-						rf.applyCh <- ApplyMsg{
-							CommandValid: true,
-							Command:      rf.logs[i].Command,
-							CommandIndex: int(rf.logs[i].Index),
-						}
-					}
-					if rf.commitIndex < entry.Index {
-						rf.commitIndex = entry.Index
-					}
-					rf.mu.Unlock()
-					return
-				}
-			case <-exitCh:
-				return
-			}
-		}
-	}()
 
 	return int(entry.Index), int(entry.Term), true
+}
+
+func (rf *Raft) replicateLogs(sid int, entry LogEntry) {
+	for {
+		// sleep for some time to reduce in-flight RPC calls
+		time.Sleep(time.Duration(rand.Intn(rf.appendEntriesInterval)) * time.Millisecond)
+
+		rf.mu.RLock()
+		entries := rf.logs.subMap(rf.nextIndex[sid], rf.logIndex+1)
+		// if the entry have already been sent
+		if len(entries) == 0 {
+			rf.mu.RUnlock()
+			return
+		}
+		prevLog := rf.logs[rf.nextIndex[sid]-1]
+		args := &AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderID:     rf.me,
+			PrevLogIndex: prevLog.Index,
+			PrevLogTerm:  prevLog.Term,
+			Entries:      entries,
+			LeaderCommit: rf.commitIndex,
+		}
+		rf.mu.RUnlock()
+		reply := &AppendEntriesReply{}
+		if !rf.isLeader() {
+			return
+		}
+		ok := rf.sendAppendEntries(sid, args, reply)
+		if !ok {
+			// according to the second 5.5 of the paper
+			// leader should keep sending request indefinitely
+			// until the follower or candidate restart
+			continue
+		} else {
+			rf.mu.RLock()
+			if reply.ErrorHint != LowTerm {
+				_, _ = DPrintf("Term_%-4d [%d]:%-9s got AE reply from [%d] with %s", rf.currentTerm, rf.me, rf.getRole(), sid, reply)
+			}
+			rf.mu.RUnlock()
+			if reply.Success {
+				rf.mu.Lock()
+				if rf.followerLogIndex[sid] < args.Entries[len(args.Entries)-1].Index {
+					rf.followerLogIndex[sid] = args.Entries[len(args.Entries)-1].Index
+					rf.nextIndex[sid] = rf.followerLogIndex[sid] + 1
+					rf.mu.Unlock()
+					rf.notifyLeaderCh <- struct{}{}
+					return
+				}
+				rf.mu.Unlock()
+				return
+			} else {
+				// skip stale reply
+				if reply.ErrorHint == LowTerm {
+					continue
+				}
+				rf.mu.Lock()
+				if rf.currentTerm < reply.Term {
+					rf.currentTerm = reply.Term
+					rf.persist()
+					rf.switchToFollower()
+					rf.mu.Unlock()
+					return
+				}
+				rf.mu.Unlock()
+				if reply.XLen != -1 {
+					args.PrevLogIndex = reply.XLen - 1
+				} else {
+					rf.mu.RLock()
+					ok, idx := rf.lastLogEntryWithTerm(reply.XTerm)
+					rf.mu.RUnlock()
+					if ok {
+						args.PrevLogIndex = idx
+					} else {
+						args.PrevLogIndex = reply.XIndex - 1
+					}
+				}
+				rf.mu.Lock()
+				rf.nextIndex[sid] = args.PrevLogIndex + 1
+				rf.mu.Unlock()
+			}
+		}
+	}
 }
 
 // lastLogEntryWithTerm checks if there exists any log with given term in the logs
@@ -860,15 +884,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	rf.role = Initial
-	rf.commitCond = sync.NewCond(&sync.Mutex{})
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.heardFromLeader = 0
 	rf.electionTimeoutLbound = 1000
-	rf.electionTimeoutUbound = 2000
+	rf.electionTimeoutUbound = 2500
 	rf.heartbeatInterval = 200 * time.Millisecond
-	//rf.nextIndex = make([]int64, len(peers))
+	rf.appendEntriesInterval = 300
 	rf.applyCh = applyCh
+	rf.notifyLeaderCh = make(chan struct{})
+	rf.followerLogIndex = make([]int64, len(peers))
+	rf.nextIndex = make([]int64, len(peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
