@@ -158,7 +158,7 @@ func (rf *Raft) switchToCandidate() {
 	}
 
 	rf.mu.RLock()
-	_, _ = DPrintf("Term_%d [%d] switch from %s to candidate", rf.currentTerm, rf.me, rf.getRole())
+	_, _ = DPrintf("Term_%-4d [%d] switch from %s to candidate", rf.currentTerm, rf.me, rf.getRole())
 	rf.mu.RUnlock()
 
 	atomic.StoreInt32((*int32)(&rf.role), int32(Candidate))
@@ -169,7 +169,7 @@ election:
 		rf.mu.Lock()
 		// increment current term
 		rf.currentTerm += 1
-		_, _ = DPrintf("Term_%d [%d] start election", rf.currentTerm, rf.me)
+		_, _ = DPrintf("Term_%-4d [%d] start election", rf.currentTerm, rf.me)
 		lastLogEntry := rf.logs[int64(len(rf.logs)-1)]
 		currentTerm := rf.currentTerm
 		// vote for self
@@ -240,7 +240,7 @@ func (rf *Raft) heartbeat() {
 	for {
 		if rf.killed() {
 			rf.mu.RLock()
-			_, _ = DPrintf("Term_%d [%d]:%9s is crashed", rf.currentTerm, rf.me, rf.getRole())
+			_, _ = DPrintf("Term_%-4d [%d]:%-9s is crashed", rf.currentTerm, rf.me, rf.getRole())
 			rf.mu.RUnlock()
 			return
 		}
@@ -276,7 +276,7 @@ func (rf *Raft) switchToLeader() {
 	}
 
 	rf.mu.RLock()
-	_, _ = DPrintf("Term_%d [%d] switch from %s to leader", rf.currentTerm, rf.me, rf.getRole())
+	_, _ = DPrintf("Term_%-4d [%d] switch from %s to leader", rf.currentTerm, rf.me, rf.getRole())
 	rf.mu.RUnlock()
 
 	atomic.StoreInt32((*int32)(&rf.role), int32(Leader))
@@ -295,7 +295,7 @@ func (rf *Raft) rebel() {
 		time.Sleep(rf.generateElectionTimeout())
 		if rf.killed() {
 			rf.mu.RLock()
-			_, _ = DPrintf("Term_%d [%d]:%9s is crashed", rf.currentTerm, rf.me, rf.getRole())
+			_, _ = DPrintf("Term_%-4d [%d]:%-9s is crashed", rf.currentTerm, rf.me, rf.getRole())
 			rf.mu.RUnlock()
 			return
 		}
@@ -317,7 +317,7 @@ func (rf *Raft) switchToFollower() {
 		return
 	}
 
-	_, _ = DPrintf("Term_%d [%d] switch from %s to follower", rf.currentTerm, rf.me, rf.getRole())
+	_, _ = DPrintf("Term_%-4d [%d] switch from %s to follower", rf.currentTerm, rf.me, rf.getRole())
 
 	// clear vote
 	rf.votedFor = -1
@@ -508,12 +508,32 @@ func (args *AppendEntriesArgs) String() string {
 	return string(byts)
 }
 
+type ErrType int8
+
+func (et ErrType) String() string {
+	switch et {
+	case LowTerm:
+		return "LowTerm"
+	case MismatchEntry:
+		return "MismatchEntry"
+	default:
+		return "Unknown"
+	}
+}
+
+const (
+	NoError ErrType = iota
+	LowTerm
+	MismatchEntry
+)
+
 type AppendEntriesReply struct {
-	Term    int64
-	Success bool
-	XTerm   int64
-	XIndex  int64
-	XLen    int64
+	Term      int64
+	Success   bool
+	ErrorHint ErrType
+	XTerm     int64
+	XIndex    int64
+	XLen      int64
 }
 
 func (reply *AppendEntriesReply) String() string {
@@ -538,12 +558,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.RLock()
 	if args.Term < rf.currentTerm {
 		reply.Success = false
+		reply.ErrorHint = LowTerm
 		reply.Term = rf.currentTerm
 		rf.mu.RUnlock()
 		return
 	}
 	if len(args.Entries) != 0 {
-		_, _ = DPrintf("Term_%d [%d]:%9s got AE request from [%d] with \nargs:%v\ncommitIndex: %d\nlogIndex: %d\n", rf.currentTerm, rf.me, rf.getRole(), args.LeaderID, args, rf.commitIndex, rf.logIndex)
+		_, _ = DPrintf("Term_%-4d [%d]:%-9s got AE request from [%d] with \nargs:%v\ncommitIndex: %d\nlogIndex: %d\n", rf.currentTerm, rf.me, rf.getRole(), args.LeaderID, args, rf.commitIndex, rf.logIndex)
 	}
 	rf.mu.RUnlock()
 
@@ -561,12 +582,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	atomic.StoreInt32(&rf.heardFromLeader, 1)
 	rf.leaderID = args.LeaderID
 	if len(args.Entries) == 0 {
-		//_, _ = DPrintf("Term_%d [%d] received heartbeat from [%d]\n", args.Term, rf.me, args.LeaderID)
+		//_, _ = DPrintf("Term_%-4d [%d] received heartbeat from [%d]\n", args.Term, rf.me, args.LeaderID)
 
 		// check if it's safe to commit some log entries
 		// based on the information in the heartbeat message
 		if rf.logIndex < args.PrevLogIndex || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 			reply.Success = false
+			reply.ErrorHint = MismatchEntry
 			return
 		} else {
 			reply.Success = true
@@ -578,6 +600,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.XTerm = -1
 			reply.XIndex = -1
 			reply.Success = false
+			reply.ErrorHint = MismatchEntry
 			return
 		} else {
 			targetEntry := rf.logs[args.PrevLogIndex]
@@ -603,6 +626,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				reply.XIndex = idx
 				reply.XTerm = targetEntry.Term
 				reply.XLen = -1
+				reply.ErrorHint = MismatchEntry
 				reply.Success = false
 				return
 			}
@@ -617,7 +641,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = args.LeaderCommit
 		}
 		for ; i <= rf.commitIndex; i++ {
-			_, _ = DPrintf("Term_%d [%d]:%9s committed at %d\n log: %v\nAll: %v", rf.currentTerm, rf.me, rf.getRole(), i, rf.logs[i], rf.logs)
+			_, _ = DPrintf("Term_%-4d [%d]:%-9s committed at %d\n log: %v\nAll: %v", rf.currentTerm, rf.me, rf.getRole(), i, rf.logs[i], rf.logs)
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				Command:      rf.logs[i].Command,
@@ -662,7 +686,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	lastLogEntry := rf.logs[entry.Index-1]
 	// append locally
 	rf.logs[entry.Index] = entry
-	_, _ = DPrintf("Term_%d [%d]:%9s start to replicate a log at %d:%v\n", rf.currentTerm, rf.me, rf.getRole(), index, entry)
+	_, _ = DPrintf("Term_%-4d [%d]:%-9s start to replicate a log at %d:%v\n", rf.currentTerm, rf.me, rf.getRole(), index, entry)
 	rf.persist()
 	rf.mu.Unlock()
 
@@ -688,12 +712,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				reply := &AppendEntriesReply{}
 				rf.sendAppendEntries(id, args, reply)
 				rf.mu.RLock()
-				_, _ = DPrintf("Term_%d [%d]:%9s got AE reply from [%d] with %s", rf.currentTerm, rf.me, rf.getRole(), id, reply)
+				_, _ = DPrintf("Term_%-4d [%d]:%-9s got AE reply from [%d] with %s", rf.currentTerm, rf.me, rf.getRole(), id, reply)
 				rf.mu.RUnlock()
 				if reply.Success {
 					successCh <- struct{}{}
 					return
 				} else {
+					// skip stale reply
+					if reply.ErrorHint == LowTerm {
+						continue
+					}
 					rf.mu.Lock()
 					if rf.currentTerm < reply.Term {
 						rf.currentTerm = reply.Term
@@ -746,7 +774,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 						return
 					}
 					rf.mu.Lock()
-					_, _ = DPrintf("Term_%d [%d]:%9s successfully committed a log at %d\n %v", rf.currentTerm, rf.me, rf.getRole(), index, rf.logs[index])
+					_, _ = DPrintf("Term_%-4d [%d]:%-9s successfully committed a log at %d\n %v", rf.currentTerm, rf.me, rf.getRole(), index, rf.logs[index])
 					for i := rf.commitIndex + 1; i <= entry.Index; i++ {
 						rf.applyCh <- ApplyMsg{
 							CommandValid: true,
