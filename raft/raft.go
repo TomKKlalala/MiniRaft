@@ -46,10 +46,6 @@ func init() {
 // CommandValid to true to indicate that the ApplyMsg contains a newly
 // committed log entry.
 //
-// in Lab 3 you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh; at that point you can add fields to
-// ApplyMsg, but set CommandValid to false for these other uses.
-//
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -452,7 +448,6 @@ func (rf *Raft) readPersist(data []byte) {
 //  RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
 	Term         int64
 	CandidateID  int
 	LastLogIndex int64
@@ -462,7 +457,6 @@ type RequestVoteArgs struct {
 // RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
-	// Your data here (2A).
 	Term        int64
 	VoteGranted bool
 }
@@ -857,7 +851,6 @@ func (rf *Raft) firstLogEntryWithTerm(term int64) int64 {
 //
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
 }
 
 func (rf *Raft) killed() bool {
