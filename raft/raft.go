@@ -22,11 +22,11 @@ import (
 	"../labrpc"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
 	_ "net/http/pprof"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -77,13 +77,13 @@ const (
 )
 
 type LogEntry struct {
-	Command interface{} `json:"-"`
+	Command interface{}
 	Index   int64
 	Term    int64
 }
 
 func (entry LogEntry) String() string {
-	return strconv.Itoa(int(entry.Term))
+	return fmt.Sprintf("%d:%d", entry.Term, entry.Command)
 }
 
 type LogEntries map[int64]LogEntry
@@ -261,6 +261,7 @@ func (rf *Raft) heartbeat() {
 					PrevLogTerm:  lastCommitEntry.Term,
 					Entries:      []LogEntry{},
 					LeaderCommit: commitIndex,
+					Heartbeat:    true,
 				}
 				reply := &AppendEntriesReply{}
 				go rf.sendAppendEntries(i, args, reply)
@@ -318,7 +319,7 @@ func (rf *Raft) switchToLeader() {
 								CommandIndex: int(rf.logs[i].Index),
 							}
 							rf.lastApplied = i
-							_, _ = DPrintf("Term_%-4d [%d]:%-9s successfully committed a log at %d\n:%v", rf.currentTerm, rf.me, rf.getRole(), minIndex, rf.logs[minIndex])
+							_, _ = DPrintf("Term_%-4d [%d]:%-9s committed a log at %d:%v", rf.currentTerm, rf.me, rf.getRole(), minIndex, rf.logs[minIndex])
 						}
 						rf.mu.Unlock()
 						break
@@ -415,7 +416,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.logs = make(map[int64]LogEntry)
 		// init first log
 		rf.logs[0] = LogEntry{
-			Command: nil,
+			Command: 0,
 			Index:   0,
 			Term:    0,
 		}
@@ -545,6 +546,7 @@ type AppendEntriesArgs struct {
 	PrevLogTerm  int64
 	LeaderCommit int64
 	Entries      []LogEntry
+	Heartbeat    bool
 }
 
 func (args *AppendEntriesArgs) String() string {
@@ -598,7 +600,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.mu.RUnlock()
 		return
 	}
-	if len(args.Entries) != 0 {
+	if args.Heartbeat != true {
 		_, _ = DPrintf("Term_%-4d [%d]:%-9s got AE request from [%d] with \nargs:%v\ncommitIndex: %d\nlogIndex: %d\n", rf.currentTerm, rf.me, rf.getRole(), args.LeaderID, args, rf.commitIndex, rf.logIndex)
 	}
 	rf.mu.RUnlock()
@@ -611,78 +613,67 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		// receive RPC from a legitimate leader
 		rf.switchToFollower()
+		return
 	}
 
 	reply.Term = rf.currentTerm
 	atomic.StoreInt32(&rf.heardFromLeader, 1)
 	rf.leaderID = args.LeaderID
-	if len(args.Entries) == 0 {
-		//_, _ = DPrintf("Term_%-4d [%d] received heartbeat from [%d]\n", args.Term, rf.me, args.LeaderID)
-
-		// check if it's safe to commit some log entries
-		// based on the information in the heartbeat message
-		if rf.logIndex < args.PrevLogIndex || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-			reply.Success = false
-			reply.ErrorHint = MismatchEntry
-			return
-		} else {
-			reply.Success = true
-			// don't return, safe to commit phase
-		}
+	var newEntryIndex int64
+	if rf.logIndex < args.PrevLogIndex {
+		reply.XLen = rf.logIndex + 1
+		reply.XTerm = -1
+		reply.XIndex = -1
+		reply.Success = false
+		reply.ErrorHint = MismatchEntry
+		return
 	} else {
-		if rf.logIndex < args.PrevLogIndex {
-			reply.XLen = rf.logIndex + 1
-			reply.XTerm = -1
-			reply.XIndex = -1
-			reply.Success = false
-			reply.ErrorHint = MismatchEntry
-			return
-		} else {
-			targetEntry := rf.logs[args.PrevLogIndex]
-			if targetEntry.Term == args.PrevLogTerm {
-				reply.Success = true
-				esize := len(args.Entries)
+		targetEntry := rf.logs[args.PrevLogIndex]
+		if targetEntry.Term == args.PrevLogTerm {
+			newEntryIndex = args.PrevLogIndex
+			reply.Success = true
+			esize := len(args.Entries)
+			if esize != 0 {
 				// skip stale request
 				if args.Entries[esize-1].Index < rf.commitIndex {
 					return
 				}
 				for i := 0; i < esize; i++ {
 					entry := args.Entries[i]
-					if entry.Index <= rf.commitIndex {
-						continue
-					}
 					rf.logs[entry.Index] = entry
 				}
 				// update log index to the last new entry
 				rf.logIndex = args.Entries[esize-1].Index
+				newEntryIndex = rf.logIndex
 				// safe to commit phase
-			} else {
-				idx := rf.firstLogEntryWithTerm(targetEntry.Term)
-				reply.XIndex = idx
-				reply.XTerm = targetEntry.Term
-				reply.XLen = -1
-				reply.ErrorHint = MismatchEntry
-				reply.Success = false
-				return
 			}
+		} else {
+			idx := rf.firstLogEntryWithTerm(targetEntry.Term)
+			reply.XIndex = idx
+			reply.XTerm = targetEntry.Term
+			reply.XLen = -1
+			reply.ErrorHint = MismatchEntry
+			reply.Success = false
+			return
 		}
 	}
-	if rf.commitIndex < args.LeaderCommit {
+	if rf.commitIndex < newEntryIndex && rf.commitIndex < args.LeaderCommit {
 		i := rf.commitIndex + 1
-		// rf.commitIndex = min(latest log index, LeaderCommit)
-		if rf.logIndex < args.LeaderCommit {
-			rf.commitIndex = rf.logIndex
+		// rf.commitIndex = min(index of last new entry, LeaderCommit)
+		if newEntryIndex < args.LeaderCommit {
+			rf.commitIndex = newEntryIndex
 		} else {
 			rf.commitIndex = args.LeaderCommit
 		}
 		for ; i <= rf.commitIndex; i++ {
-			_, _ = DPrintf("Term_%-4d [%d]:%-9s committed at %d\n log: %v\nAll: %v", rf.currentTerm, rf.me, rf.getRole(), i, rf.logs[i], rf.logs)
+			_, _ = DPrintf("Term_%-4d [%d]:%-9s committed at %d:%v\nAll: %v", rf.currentTerm, rf.me, rf.getRole(), i, rf.logs[i], rf.logs)
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				Command:      rf.logs[i].Command,
 				CommandIndex: int(rf.logs[i].Index),
 			}
 		}
+		_, _ = DPrintf("Term_%-4d [%d]:%-9s before AE response: commitIndex: %d logIndex: %d\n", rf.currentTerm, rf.me, rf.getRole(), rf.commitIndex, rf.logIndex)
 	}
 }
 
@@ -717,7 +708,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// append locally
 	rf.logs[entry.Index] = entry
 	rf.followerLogIndex[rf.me] = rf.logIndex
-	_, _ = DPrintf("Term_%-4d [%d]:%-9s start to replicate a log at %d:%v:%v\n", rf.currentTerm, rf.me, rf.getRole(), rf.logIndex, entry, entry.Command)
+	_, _ = DPrintf("Term_%-4d [%d]:%-9s start to replicate a log at %d:%v\n", rf.currentTerm, rf.me, rf.getRole(), rf.logIndex, entry)
 	rf.persist()
 	rf.mu.Unlock()
 
@@ -733,16 +724,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) replicateLogs(sid int, entry LogEntry) {
+	isMismatch := false
 	for {
 		// sleep for some time to reduce in-flight RPC calls
 		time.Sleep(time.Duration(rand.Intn(rf.appendEntriesInterval)) * time.Millisecond)
 
+		var entries []LogEntry
 		rf.mu.RLock()
-		entries := rf.logs.subMap(rf.nextIndex[sid], rf.logIndex+1)
-		// if the entry have already been sent
-		if len(entries) == 0 {
-			rf.mu.RUnlock()
-			return
+		if !isMismatch {
+			entries = rf.logs.subMap(rf.nextIndex[sid], rf.logIndex+1)
+			// if the entry have already been sent
+			if len(entries) == 0 {
+				rf.mu.RUnlock()
+				return
+			}
 		}
 		prevLog := rf.logs[rf.nextIndex[sid]-1]
 		args := &AppendEntriesArgs{
@@ -771,6 +766,10 @@ func (rf *Raft) replicateLogs(sid int, entry LogEntry) {
 			}
 			rf.mu.RUnlock()
 			if reply.Success {
+				if isMismatch {
+					isMismatch = false
+					continue
+				}
 				rf.mu.Lock()
 				if rf.followerLogIndex[sid] < args.Entries[len(args.Entries)-1].Index {
 					rf.followerLogIndex[sid] = args.Entries[len(args.Entries)-1].Index
@@ -810,6 +809,9 @@ func (rf *Raft) replicateLogs(sid int, entry LogEntry) {
 				rf.mu.Lock()
 				rf.nextIndex[sid] = args.PrevLogIndex + 1
 				rf.mu.Unlock()
+				if reply.ErrorHint == MismatchEntry {
+					isMismatch = true
+				}
 			}
 		}
 	}
