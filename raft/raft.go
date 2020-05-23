@@ -724,14 +724,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) replicateLogs(sid int, entry LogEntry) {
-	isMismatch := false
+	withEntries := true
 	for {
 		// sleep for some time to reduce in-flight RPC calls
 		time.Sleep(time.Duration(rand.Intn(rf.appendEntriesInterval)) * time.Millisecond)
 
 		var entries []LogEntry
 		rf.mu.RLock()
-		if !isMismatch {
+		if withEntries {
 			entries = rf.logs.subMap(rf.nextIndex[sid], rf.logIndex+1)
 			// if the entry have already been sent
 			if len(entries) == 0 {
@@ -755,6 +755,7 @@ func (rf *Raft) replicateLogs(sid int, entry LogEntry) {
 		}
 		ok := rf.sendAppendEntries(sid, args, reply)
 		if !ok {
+			withEntries = false
 			// according to the second 5.5 of the paper
 			// leader should keep sending request indefinitely
 			// until the follower or candidate restart
@@ -766,8 +767,8 @@ func (rf *Raft) replicateLogs(sid int, entry LogEntry) {
 			}
 			rf.mu.RUnlock()
 			if reply.Success {
-				if isMismatch {
-					isMismatch = false
+				if !withEntries {
+					withEntries = true
 					continue
 				}
 				rf.mu.Lock()
@@ -810,7 +811,7 @@ func (rf *Raft) replicateLogs(sid int, entry LogEntry) {
 				rf.nextIndex[sid] = args.PrevLogIndex + 1
 				rf.mu.Unlock()
 				if reply.ErrorHint == MismatchEntry {
-					isMismatch = true
+					withEntries = false
 				}
 			}
 		}
