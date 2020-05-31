@@ -1,5 +1,7 @@
 package kvraft
 
+import "encoding/json"
+
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
@@ -7,6 +9,8 @@ const (
 )
 
 type Err string
+
+const NotLeaderErr Err = "not leader"
 
 // Put or Append
 type PutAppendArgs struct {
@@ -16,6 +20,11 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+}
+
+func (args PutAppendArgs) String() string {
+	s, _ := json.Marshal(args)
+	return string(s)
 }
 
 type PutAppendReply struct {

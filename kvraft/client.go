@@ -1,13 +1,18 @@
 package kvraft
 
-import "../labrpc"
+import (
+	"../labrpc"
+	"sync"
+	"time"
+)
 import "crypto/rand"
 import "math/big"
-
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	curLeader int
+	mu        sync.Mutex
 }
 
 func nrand() int64 {
@@ -21,6 +26,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.curLeader = 0
 	return ck
 }
 
@@ -39,7 +45,32 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	var serverLen = len(ck.servers)
+	args := GetArgs{Key: key}
+
+	startIndex := ck.curLeader
+	for {
+		reply := GetReply{}
+		DPrintf("[Clerk Get to server %d] try to send request: %v\n", ck.curLeader, args)
+		ok := ck.servers[ck.curLeader].Call("KVServer.Get", &args, &reply)
+		if !ok {
+			continue
+		}
+		if reply.Err == "" {
+			_, _ = DPrintf("[Clerk Get from server %d] key: [%s] value: [%s]", ck.curLeader, key, reply.Value)
+			return reply.Value
+		} else {
+			_, _ = DPrintf("[Clerk Get from server %d] key: [%s] error: [%s]", ck.curLeader, key, reply.Err)
+		}
+		if reply.Err == NotLeaderErr {
+			ck.mu.Lock()
+			ck.curLeader = (ck.curLeader + 1) % serverLen
+			ck.mu.Unlock()
+		}
+		if startIndex == ck.curLeader {
+			time.Sleep(1000 * time.Millisecond)
+		}
+	}
 }
 
 //
@@ -54,6 +85,37 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	var serverLen = len(ck.servers)
+	args := PutAppendArgs{
+		Key:   key,
+		Value: value,
+		Op:    op,
+	}
+	startIndex := ck.curLeader
+	for {
+		reply := PutAppendReply{}
+		DPrintf("[Clerk PutAppend to server %d] try to send request: %v\n", ck.curLeader, args)
+		ok := ck.servers[ck.curLeader].Call("KVServer.PutAppend", &args, &reply)
+		if !ok {
+			continue
+		}
+		if reply.Err != "" {
+			_, _ = DPrintf("[Clerk PutAppend from server %d]: %s key: [%s] value: [%s] error: [%s]", ck.curLeader, op, key, value, reply.Err)
+			if reply.Err != NotLeaderErr {
+				continue
+			} else {
+				ck.mu.Lock()
+				ck.curLeader = (ck.curLeader + 1) % serverLen
+				ck.mu.Unlock()
+			}
+		} else {
+			_, _ = DPrintf("[Clerk PutAppend from server %d]: %s key: [%s] value: [%s] succeed", ck.curLeader, op, key, value)
+			return
+		}
+		if startIndex == ck.curLeader {
+			time.Sleep(1000 * time.Millisecond)
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

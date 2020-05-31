@@ -52,6 +52,11 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+func (msg ApplyMsg) String() string {
+	s, _ := json.Marshal(msg)
+	return string(s)
+}
+
 type Role int32
 
 func (r Role) String() string {
