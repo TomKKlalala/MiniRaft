@@ -5,9 +5,9 @@ import (
 	"../labrpc"
 	"../raft"
 	"log"
-	"reflect"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = 0
@@ -23,14 +23,12 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Key     string
-	Value   string
-	Command string
-}
-
-type PendingOp struct {
-	op   Op
-	cond sync.Cond
+	Key       string
+	Value     string
+	Command   string
+	SerialNum int64
+	ClientID  int64
+	Term      int
 }
 
 type KVServer struct {
@@ -43,60 +41,128 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	states        map[string]string
-	pendingOpChMu sync.RWMutex
-	pendingOpCh   map[int][]chan interface{}
+	database         map[string]string
+	pendingOpCh      map[int]chan interface{} // log index => chan
+	requestMask      map[int64]int64
+	waitTimeLimit    time.Duration
+	lastAppliedIndex int
+}
+
+func (kv *KVServer) dprintf(format string, a ...interface{}) {
+	//if kv.rf.IsLeader() {
+	DPrintf(format, a...)
+	//}
+}
+
+func (kv *KVServer) getPendingOpCh(idx int) chan interface{} {
+	if kv.pendingOpCh[idx] == nil {
+		kv.pendingOpCh[idx] = make(chan interface{}, 1)
+	}
+	return kv.pendingOpCh[idx]
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	op := Op{
 		Key:     args.Key,
-		Command: "Get",
+		Command: GetCmd,
 	}
 
-	index, _, isLeader := kv.rf.Start(op)
+	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
-		reply.Err = "not leader"
+		reply.Err = NotLeaderErr
 		return
 	}
-	opCh := make(chan interface{}, 1)
-	kv.pendingOpCh[index] = append(kv.pendingOpCh[index], opCh)
-	appliedOp := <-opCh
-	if reflect.DeepEqual(op, appliedOp) {
-		DPrintf("server[%d] commit get log at %d succeed\n", kv.me, index)
-		kv.mu.RLock()
-		defer kv.mu.RUnlock()
-		reply.Value = kv.states[op.Key]
-	} else {
-		DPrintf("server[%d] commit get log at %d failed\n", kv.me, index)
-		reply.Err = "get failed"
+
+	kv.dprintf("server[%d] receive new read log from clerk [%d] at %d args: %v\n", kv.me, op.ClientID, index, args)
+	kv.mu.Lock()
+	opCh := kv.getPendingOpCh(index)
+	kv.mu.Unlock()
+
+	kv.dprintf("server[%d] start to wait commit get log at %d\n", kv.me, index)
+	select {
+	case appliedOp := <-opCh:
+		if term == appliedOp.(Op).Term {
+			reply.Value = appliedOp.(Op).Value
+			reply.Err = OK
+		} else {
+			reply.Err = CommitFailedErr
+		}
+	case <-time.After(kv.waitTimeLimit * time.Millisecond):
+		reply.Err = TimeoutErr
 	}
+	kv.dprintf("server[%d] reply to client [%d] get request args: %v reply: %v\n", kv.me, op.ClientID, args, reply)
+	return
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	op := Op{
-		Key:     args.Key,
-		Value:   args.Value,
-		Command: args.Op,
+		Key:       args.Key,
+		Value:     args.Value,
+		Command:   args.Op,
+		SerialNum: args.SerialNum,
+		ClientID:  args.ClientID,
 	}
 
-	index, _, isLeader := kv.rf.Start(op)
-	if !isLeader {
-		reply.Err = "not leader"
-		return
-	}
-	opCh := make(chan interface{}, 1)
-	kv.pendingOpCh[index] = append(kv.pendingOpCh[index], opCh)
-	appliedOp := <-opCh
-	if reflect.DeepEqual(op, appliedOp) {
-		DPrintf("server[%d] commit write log at %d succeed\n", kv.me, index)
-		return
+	var opCh chan interface{}
+	var index int
+	var term int
+	var isLeader bool
+
+	kv.mu.Lock()
+
+	// filter duplicate requests
+	if !kv.isDuplicatedRequest(op) {
+		if args.ExpectedIndex == 0 {
+			index, term, isLeader = kv.rf.Start(op)
+			if !isLeader {
+				kv.mu.Unlock()
+				reply.Err = NotLeaderErr
+				return
+			}
+		} else {
+			if args.ExpectedIndex <= kv.lastAppliedIndex {
+				kv.mu.Unlock()
+				reply.Err = CommitFailedErr
+				kv.dprintf("server[%d] reply to client [%d] write request args: %v reply: %v\n", kv.me, op.ClientID, args, reply)
+				return
+			}
+			index = args.ExpectedIndex
+			term = args.ExpectedTerm
+		}
+		kv.dprintf("server[%d] receive new write log from clerk [%d] at %d args: %v\n", kv.me, op.ClientID, index, args)
+		opCh = kv.getPendingOpCh(index)
+		kv.mu.Unlock()
 	} else {
-		DPrintf("server[%d] commit write log at %d failed\n", kv.me, index)
-		reply.Err = "commit failed"
+		kv.mu.Unlock()
+		reply.Err = OK
+		return
 	}
+
+	select {
+	case appliedOp := <-opCh:
+		if term == appliedOp.(Op).Term {
+			reply.Err = OK
+		} else {
+			reply.Err = CommitFailedErr
+		}
+	case <-time.After(kv.waitTimeLimit * time.Millisecond):
+		reply.ExpectedIndex = index
+		reply.ExpectedTerm = term
+		reply.Err = TimeoutErr
+	}
+	kv.dprintf("server[%d] reply to client [%d] write request args: %v reply: %v\n", kv.me, op.ClientID, args, reply)
+	return
+}
+
+// ensure FIFO client request
+func (kv *KVServer) isDuplicatedRequest(op Op) bool {
+	if op.SerialNum <= kv.requestMask[op.ClientID] {
+		return true
+	}
+
+	return false
 }
 
 func (kv *KVServer) apply() {
@@ -104,23 +170,42 @@ func (kv *KVServer) apply() {
 		if kv.killed() {
 			return
 		}
-		msg := <-kv.applyCh
-		op := msg.Command.(Op)
-		kv.mu.Lock()
-		if op.Command == "Put" {
-			kv.states[op.Key] = op.Value
-		} else if op.Command == "Append" {
-			kv.states[op.Key] = kv.states[op.Key] + op.Value
+		msg, ok := <-kv.applyCh
+		if !ok {
+			kv.dprintf("server[%d] apply channel closed\n", kv.me)
+			return
 		}
-		DPrintf("server[%d] received Apply message: %v\nstates: %v\n", kv.me, msg, kv.states)
+		op := msg.Command.(Op)
+		op.Term = int(msg.CommandTerm)
+		kv.mu.Lock()
+		kv.dprintf("server[%d] received Apply message: %v\nrequest mask: %v\n", kv.me, msg, kv.requestMask)
+		kv.lastAppliedIndex = msg.CommandIndex
+		// filter duplicated requests
+		if op.Command != GetCmd && kv.requestMask[op.ClientID] < op.SerialNum {
+			if op.Command == PutCmd {
+				kv.database[op.Key] = op.Value
+				kv.requestMask[op.ClientID] = op.SerialNum
+			} else if op.Command == AppendCmd {
+				kv.database[op.Key] += op.Value
+				kv.requestMask[op.ClientID] = op.SerialNum
+			}
+		}
+		if op.Command == GetCmd {
+			op.Value = kv.database[op.Key]
+		}
+		kv.dprintf("server[%d] processed Apply message at: %d\ndatabase: %v\n", kv.me, msg.CommandIndex, kv.database)
+
 		kv.mu.Unlock()
 
-		kv.pendingOpChMu.Lock()
-		for i := 0; i < len(kv.pendingOpCh[msg.CommandIndex]); i++ {
-			kv.pendingOpCh[msg.CommandIndex][i] <- msg.Command
-		}
-		delete(kv.pendingOpCh, msg.CommandIndex)
-		kv.pendingOpChMu.Unlock()
+		go func() {
+			kv.mu.Lock()
+			// notify client
+			if kv.pendingOpCh[msg.CommandIndex] != nil {
+				kv.pendingOpCh[msg.CommandIndex] <- op
+				delete(kv.pendingOpCh, msg.CommandIndex)
+			}
+			kv.mu.Unlock()
+		}()
 	}
 }
 
@@ -170,12 +255,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 1000)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	kv.states = make(map[string]string)
-	kv.pendingOpCh = make(map[int][]chan interface{})
+	kv.database = make(map[string]string)
+	kv.pendingOpCh = make(map[int]chan interface{})
+	kv.requestMask = make(map[int64]int64)
+	kv.waitTimeLimit = 400
 	go kv.apply()
 	return kv
 }

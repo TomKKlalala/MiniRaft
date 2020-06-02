@@ -3,16 +3,26 @@ package kvraft
 import (
 	"../labrpc"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 import "crypto/rand"
 import "math/big"
 
+var cid int64 = -1
+
+func getClientID() int64 {
+	return atomic.AddInt64(&cid, 1)
+}
+
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	curLeader int
-	mu        sync.Mutex
+	curLeader         int
+	mu                sync.RWMutex
+	clientID          int64
+	serialNum         int64
+	timeoutRetryTimes int
 }
 
 func nrand() int64 {
@@ -27,7 +37,14 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.curLeader = 0
+	ck.clientID = getClientID()
+	ck.serialNum = 0
+	ck.timeoutRetryTimes = len(ck.servers)
 	return ck
+}
+
+func (ck *Clerk) getSerialNum() int64 {
+	return atomic.AddInt64(&ck.serialNum, 1)
 }
 
 //
@@ -48,27 +65,30 @@ func (ck *Clerk) Get(key string) string {
 	var serverLen = len(ck.servers)
 	args := GetArgs{Key: key}
 
-	startIndex := ck.curLeader
+	ck.mu.RLock()
+	serverIndex := ck.curLeader
+	ck.mu.RUnlock()
+	startIndex := serverIndex
 	for {
 		reply := GetReply{}
-		DPrintf("[Clerk Get to server %d] try to send request: %v\n", ck.curLeader, args)
-		ok := ck.servers[ck.curLeader].Call("KVServer.Get", &args, &reply)
-		if !ok {
-			continue
+		DPrintf("[Clerk %d Get to server [%d] try to send request: %v\n", ck.clientID, serverIndex, args)
+		ok := ck.servers[serverIndex].Call("KVServer.Get", &args, &reply)
+		if ok {
+			if reply.Err == OK {
+				_, _ = DPrintf("[Clerk %d Get from server [%d] key: [%s] value: [%s]", ck.clientID, serverIndex, key, reply.Value)
+				ck.mu.Lock()
+				ck.curLeader = serverIndex
+				ck.mu.Unlock()
+				return reply.Value
+			} else {
+				if reply.Err != NotLeaderErr {
+					_, _ = DPrintf("[Clerk %d Get from server [%d] key: [%s] error: [%s]", ck.clientID, serverIndex, key, reply.Err)
+				}
+			}
 		}
-		if reply.Err == "" {
-			_, _ = DPrintf("[Clerk Get from server %d] key: [%s] value: [%s]", ck.curLeader, key, reply.Value)
-			return reply.Value
-		} else {
-			_, _ = DPrintf("[Clerk Get from server %d] key: [%s] error: [%s]", ck.curLeader, key, reply.Err)
-		}
-		if reply.Err == NotLeaderErr {
-			ck.mu.Lock()
-			ck.curLeader = (ck.curLeader + 1) % serverLen
-			ck.mu.Unlock()
-		}
-		if startIndex == ck.curLeader {
-			time.Sleep(1000 * time.Millisecond)
+		serverIndex = (serverIndex + 1) % serverLen
+		if serverIndex == startIndex {
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }
@@ -87,33 +107,57 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	var serverLen = len(ck.servers)
 	args := PutAppendArgs{
-		Key:   key,
-		Value: value,
-		Op:    op,
+		Key:       key,
+		Value:     value,
+		Op:        op,
+		SerialNum: ck.getSerialNum(),
+		ClientID:  ck.clientID,
 	}
-	startIndex := ck.curLeader
+	ck.mu.RLock()
+	serverIndex := ck.curLeader
+	ck.mu.RUnlock()
+	startIndex := serverIndex
+	retryTimes := 0
 	for {
 		reply := PutAppendReply{}
-		DPrintf("[Clerk PutAppend to server %d] try to send request: %v\n", ck.curLeader, args)
-		ok := ck.servers[ck.curLeader].Call("KVServer.PutAppend", &args, &reply)
+		DPrintf("[Clerk %d PutAppend to server %d] try to send request: %v\n", ck.clientID, serverIndex, args)
+		ok := ck.servers[serverIndex].Call("KVServer.PutAppend", &args, &reply)
 		if !ok {
-			continue
-		}
-		if reply.Err != "" {
-			_, _ = DPrintf("[Clerk PutAppend from server %d]: %s key: [%s] value: [%s] error: [%s]", ck.curLeader, op, key, value, reply.Err)
-			if reply.Err != NotLeaderErr {
-				continue
-			} else {
-				ck.mu.Lock()
-				ck.curLeader = (ck.curLeader + 1) % serverLen
-				ck.mu.Unlock()
-			}
+			// the message could be dropped or the server crashed after received the msg
+			_, _ = DPrintf("[Clerk %d PutAppend from server %d]: %s key: [%s] value: [%s] error: [failed request, retry]", ck.clientID, serverIndex, op, key, value)
+			// failed request, try another server, in case of server crash
 		} else {
-			_, _ = DPrintf("[Clerk PutAppend from server %d]: %s key: [%s] value: [%s] succeed", ck.curLeader, op, key, value)
-			return
+			if reply.Err == OK {
+				_, _ = DPrintf("[Clerk %d PutAppend from server %d]: %s key: [%s] value: [%s] succeed", ck.clientID, ck.curLeader, op, key, value)
+				ck.mu.Lock()
+				ck.curLeader = serverIndex
+				ck.mu.Unlock()
+				return
+			} else {
+				if reply.Err == CommitFailedErr {
+					_, _ = DPrintf("[Clerk %d PutAppend from server %d]: %s key: [%s] value: [%s] error: [%s]", ck.clientID, serverIndex, op, key, value, reply.Err)
+					args.ExpectedIndex = 0
+					args.ExpectedTerm = 0
+				} else if reply.Err == NotLeaderErr {
+
+				} else if reply.Err == TimeoutErr {
+					// commit failed, submit again
+					_, _ = DPrintf("[Clerk %d PutAppend from server %d]: %s key: [%s] value: [%s] error: [%s]", ck.clientID, serverIndex, op, key, value, reply.Err)
+					args.ExpectedIndex = reply.ExpectedIndex
+					args.ExpectedTerm = reply.ExpectedTerm
+					retryTimes++
+					if ck.timeoutRetryTimes <= retryTimes {
+						args.ExpectedIndex = 0
+						args.ExpectedTerm = 0
+						retryTimes = 0
+					}
+					// change server in case of network partition
+				}
+			}
 		}
-		if startIndex == ck.curLeader {
-			time.Sleep(1000 * time.Millisecond)
+		serverIndex = (serverIndex + 1) % serverLen
+		if serverIndex == startIndex {
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }
